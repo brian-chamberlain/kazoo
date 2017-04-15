@@ -540,7 +540,9 @@ record_voicemail(AttachmentName, #mailbox{max_message_length=MaxMessageLength
                 andalso review_recording(AttachmentName, 'true', Box, Call)
             of
                 'false' ->
-                    new_message(AttachmentName, Length, Box, Call);
+                    new_message(AttachmentName, Length, Box, Call),
+                    NewCall = kapps_call:set_message_left('true', Call),
+                    cf_exe:set_call(NewCall),
                 {'ok', 'record'} ->
                     record_voicemail(tmp_file(Ext), Box, Call);
                 {'ok', _Selection} ->
@@ -985,7 +987,7 @@ forward_message(AttachmentName, Length, Message, SrcBoxId, #mailbox{mailbox_numb
                     ]
                    ),
     case kvm_message:forward_message(Call, Message, SrcBoxId, NewMsgProps) of
-        'ok' -> send_mwi_update(DestBox, Call);
+        {'ok', NewCall} -> send_mwi_update(DestBox, NewCall);
         {'error', _, _Msg} ->
             lager:warning("failed to save forwarded voice mail message recorded media : ~p", [_Msg])
     end.
@@ -1498,7 +1500,7 @@ new_message(AttachmentName, Length, #mailbox{mailbox_number=BoxNum
                   ,{<<"Timezone">>, Timezone}
                   ],
     case kvm_message:new(Call, NewMsgProps) of
-        'ok' -> send_mwi_update(Box, Call);
+        {'ok', NewCall} -> send_mwi_update(Box, NewCall);
         {'error', _, _Msg} -> lager:warning("failed to save voice mail message recorded media : ~p", [_Msg])
     end.
 

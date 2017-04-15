@@ -361,6 +361,7 @@ handle_info({'event', [CallId | Props]}, #state{node=Node
             gen_listener:cast(self(), {'channel_redirected', Props}),
             {'noreply', State};
         {<<"CHANNEL_DESTROY">>, _} ->
+            io:format("~n ecallmgr CHANNEL_DESTROY~n"),
             maybe_process_channel_destroy(Node, CallId, Props),
             {'noreply', State};
         {<<"CHANNEL_ANSWER">>, _} ->
@@ -380,6 +381,7 @@ handle_info({'event', [CallId | Props]}, #state{node=Node
         {<<"RECORD_STOP">>, _} -> {'noreply', State};
         {<<"RECORD_START">>, _} -> {'noreply', State};
         {_A, _B} ->
+            io:format("~n ecallmgr _A ~p~n", [_A]),
             process_channel_event(Props),
             {'noreply', State}
     end;

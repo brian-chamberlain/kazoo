@@ -33,6 +33,9 @@
 -export([add_event_listener/2]).
 -export([next/1, next/2]).
 -export([update_call/1, update_call/2]).
+-export([add_destroyed_handler/2
+        ,remove_destroyed_handler/2
+        ]).
 
 %% gen_listener callbacks
 -export([init/1
@@ -69,6 +72,7 @@
                ,stop_on_destroy = 'true' :: boolean()
                ,destroyed = 'false' :: boolean()
                ,branch_count = ?MAX_BRANCH_COUNT :: non_neg_integer()
+               ,destroyed_handlers = [] :: list()
                }).
 -type state() :: #state{}.
 
@@ -153,6 +157,18 @@ add_event_listener(Srv, {_,_}=SpawnInfo) when is_pid(Srv) ->
     gen_listener:cast(Srv, {'add_event_listener', SpawnInfo});
 add_event_listener(Call, {_,_}=SpawnInfo) ->
     add_event_listener(kapps_call:kvs_fetch('consumer_pid', Call), SpawnInfo).
+
+-spec add_destroyed_handler(kapps_call:call() | pid(), {atom(), atom(), list()}) -> 'ok'.
+add_destroyed_handler(Srv, {_,_,_}=Handler) when is_pid(Srv) ->
+    gen_listener:call(Srv, {'add_destroyed_handler', Handler});
+add_destroyed_handler(Call, {_,_,_}=Handler) ->
+    add_destroyed_handler(kapps_call:kvs_fetch('consumer_pid', Call), Handler).
+
+-spec remove_destroyed_handler(kapps_call:call() | pid(), {atom(), atom(), list()}) -> 'ok'.
+remove_destroyed_handler(Srv, {_,_,_}=Handler) when is_pid(Srv) ->
+    gen_listener:call(Srv, {'remove_destroyed_handler', Handler});
+remove_destroyed_handler(Call, {_,_,_}=Handler) ->
+    remove_destroyed_handler(kapps_call:kvs_fetch('consumer_pid', Call), Handler).
 
 -spec stop(kapps_call:call() | pid()) -> 'ok'.
 stop(Srv) when is_pid(Srv) ->
@@ -373,6 +389,10 @@ handle_call({'next', Key}, _From, #state{flow=Flow}=State) ->
 handle_call({'amqp_call', API, PubFun, VerifyFun}, _From, #state{queue=Q}=State) ->
     Reply = amqp_call_message(API, PubFun, VerifyFun, Q),
     {'reply', Reply, State};
+handle_call({'add_destroyed_handler', {_M, _F, _Args}=H},  _From, #state{destroyed_handlers=Handlers}=State) ->
+    {'reply', 'ok', State#state{destroyed_handlers=lists:usort([H || Handlers])}};
+handle_call({'remove_destroyed_handler', {_M, _F, _Args}=H},  _From, #state{destroyed_handlers=Handlers}=State) ->
+    {'reply', 'ok', State#state{destroyed_handlers=lists:delete(H, Handlers)}};
 handle_call(_Request, _From, State) ->
     Reply = {'error', 'unimplemented'},
     {'reply', Reply, State}.
@@ -412,17 +432,27 @@ handle_cast({'continue', Key}, #state{flow=Flow
         NewFlow ->
             {'noreply', launch_cf_module(State#state{flow=NewFlow})}
     end;
-handle_cast('stop', #state{flows=[]}=State) ->
+handle_cast('stop', #state{flows=[]
+                          ,call=Call
+                          ,destroyed_handlers=Handlers
+                          }=State) ->
+    maybe_run_destory_handlers(Call, kz_json:new(), Handlers),
     {'stop', 'normal', State};
 handle_cast('stop', #state{flows=[Flow|Flows]}=State) ->
     {'noreply', launch_cf_module(State#state{flow=Flow, flows=Flows})};
-handle_cast('hard_stop', State) ->
+handle_cast('hard_stop', #state{call=Call
+                               ,destroyed_handlers=Handlers
+                               }=State) ->
+    maybe_run_destory_handlers(Call, kz_json:new(), Handlers),
     {'stop', 'normal', State};
 handle_cast('transfer', State) ->
     {'stop', {'shutdown', 'transfer'}, State};
 handle_cast('control_usurped', State) ->
     {'stop', {'shutdown', 'control_usurped'}, State};
-handle_cast('channel_destroyed', State) ->
+handle_cast('channel_destroyed', #state{call=Call
+                                       ,destroyed_handlers=Handlers
+                                       }=State) ->
+    maybe_run_destory_handlers(Call, kz_json:new(), Handlers),
     {'noreply', State#state{destroyed='true'}};
 handle_cast('stop_on_destroy', State) ->
     {'noreply', State#state{stop_on_destroy='true'}};
@@ -558,6 +588,7 @@ handle_info(_Msg, State) ->
 handle_event(JObj, #state{cf_module_pid=PidRef
                          ,call=Call
                          ,self=Self
+                         ,destroyed_handlers=DestoryHandlers
                          }) ->
     CallId = kapps_call:call_id_direct(Call),
     Others = kapps_call:kvs_fetch('cf_event_pids', [], Call),
@@ -568,13 +599,15 @@ handle_event(JObj, #state{cf_module_pid=PidRef
 
     case {kapps_util:get_event_type(JObj), kz_json:get_value(<<"Call-ID">>, JObj)} of
         {{<<"call_event">>, <<"CHANNEL_DESTROY">>}, CallId} ->
-            handle_channel_destroyed(Self, Notify, JObj);
+            handle_channel_destroyed(Self, Notify, JObj, Call, DestoryHandlers);
         {{<<"call_event">>, <<"CHANNEL_DISCONNECTED">>}, CallId} ->
-            handle_channel_destroyed(Self, Notify, JObj);
+            handle_channel_destroyed(Self, Notify, JObj, Call, DestoryHandlers);
         {{<<"call_event">>, <<"CHANNEL_TRANSFEREE">>}, _} ->
             handle_channel_transfer(Call, JObj);
         {{<<"call_event">>, <<"CHANNEL_REPLACED">>}, _} ->
             handle_channel_replaced(Call, JObj, Notify);
+        {{<<"call_event">>, <<"CHANNEL_BRIDGE">>}, _} ->
+            handle_channel_bridged(Self, Notify, JObj, Call);
         {{<<"call_event">>, <<"usurp_control">>}, CallId} ->
             handle_usurp(Self, Call, JObj);
         {{<<"error">>, _}, _} ->
@@ -777,10 +810,11 @@ log_call_information(Call) ->
     end,
     lager:info("authorizing id ~s", [kapps_call:authorizing_id(Call)]).
 
--spec handle_channel_destroyed(pid(), pids(), kz_json:object()) -> 'ok'.
-handle_channel_destroyed(Self, Notify, JObj) ->
+-spec handle_channel_destroyed(pid(), pids(), kz_json:object(), kapps_call:call(), list()) -> 'ok'.
+handle_channel_destroyed(Self, Notify, JObj, Call, DestoryHandlers) ->
     channel_destroyed(Self),
-    relay_message(Notify, JObj).
+    relay_message(Notify, JObj),
+    maybe_run_destory_handlers(Call, JObj, DestoryHandlers).
 
 -spec handle_channel_transfer(kapps_call:call(), kz_json:object()) -> 'ok'.
 handle_channel_transfer(Call, JObj) ->
@@ -802,6 +836,11 @@ handle_channel_replaced(Call, JObj, Notify) ->
             relay_message(Notify, JObj);
         'false' -> 'ok'
     end.
+
+-spec handle_channel_bridged(pid(), pids(), kz_json:object(), kapps_call:call()) -> 'ok'.
+handle_channel_bridged(Self, Notify, JObj, Call) ->
+    gen_listener:cast(Self, {set_call, kapps_call:set_call_bridged('true', Call)}),
+    relay_message(Notify, JObj).
 
 -spec handle_usurp(pid(), kapps_call:call(), kz_json:object()) -> 'ok'.
 handle_usurp(Self, Call, JObj) ->
@@ -826,6 +865,12 @@ relay_message(Notify, Message) ->
          || Pid <- Notify
                 ,is_pid(Pid)
         ],
+    'ok'.
+
+-spec maybe_run_destory_handlers(kapps_call:call(), kz_json:object(), list()) -> 'ok'.
+maybe_run_destory_handlers(Call, JObj, Handlers) ->
+    io:format("~n bridged ~p message ~p ~n", [kapps_call:call_bridged(Call), kapps_call:message_left(Call)]),
+    _ = lists:map(fun({M, F, Args}) -> erlang:apply(M, F, [Call, JObj | Args]) end, Handlers),
     'ok'.
 
 -spec get_pid({pid(), reference()} | 'undefined') -> api_pid().
